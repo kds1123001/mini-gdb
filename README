@@ -1,0 +1,133 @@
+# mini-gdb
+
+x86-64 Linux process debugger built directly on `ptrace(2)`. ELF64 parsing,
+software breakpoints via `INT3` injection, and hardware watchpoints via the
+DR0–DR7 debug registers. No libc debugging APIs, no libunwind, no capstone —
+just raw `PTRACE_*` requests and manual ELF section walking.
+
+## Build
+
+```
+make
+make test-target   # builds test/target, a toy binary to debug
+```
+
+Requires x86-64 Linux, `CAP_SYS_PTRACE` (or matching uid + permissive
+`yama/ptrace_scope`), gcc.
+
+## Usage
+
+```
+./minigdb [path-to-binary]
+mini-gdb> load test/target
+mini-gdb> break compute
+mini-gdb> run
+mini-gdb> cont
+mini-gdb> regs
+mini-gdb> watch 0x404034 write 4
+mini-gdb> step
+mini-gdb> quit
+```
+
+### Commands
+
+| command | effect |
+|---|---|
+| `load <path>` | parse ELF64 headers + symtab/dynsym |
+| `run [args]` | fork+exec target under `PTRACE_TRACEME`, apply pending breakpoints |
+| `attach <pid>` | `PTRACE_ATTACH` to a running process |
+| `detach` | `PTRACE_DETACH` |
+| `break <sym\|0xaddr>` | software breakpoint (`INT3` patch), can be set before `run` for PIE/static binaries |
+| `watch <addr> [exec\|write\|rw] [len]` | hardware watchpoint on DR0–DR3, requires a running target |
+| `cont` / `c` | resume, transparently stepping off a breakpoint at current `rip` first |
+| `step` / `s` | `PTRACE_SINGLESTEP` |
+| `regs` | dump GPRs + rip/rsp/rbp/eflags |
+| `mem <addr> [len]` | hex dump of target memory via `PTRACE_PEEKTEXT` |
+| `syms` | list `STT_FUNC` symbols from the loaded ELF |
+| `bplist` / `wplist` | list active breakpoints/watchpoints |
+| `kill` | `SIGKILL` the target |
+| `quit` / `q` | kill target if running, exit |
+
+## How it works
+
+**ELF parsing** (`elf_parser.c`) — mmaps the file, walks the section header
+table for `SHT_SYMTAB`/`SHT_DYNSYM`, resolves names against the linked
+strtab. No dependency on `libelf`/`libbfd`. Distinguishes `ET_EXEC` (fixed
+addresses) from `ET_DYN` (PIE, addresses relative to a runtime load base).
+
+**Load base resolution** — for PIE binaries, addresses in the symbol table
+are file-relative offsets. The actual runtime base is read from
+`/proc/<pid>/maps` by matching the mapped file's basename against the
+executable path. Breakpoints set before `run` are stored as unrelocated
+offsets and only translated to live addresses once the load base is known
+(immediately after `PTRACE_TRACEME` + `execve` traps, before the child runs
+any of its own code).
+
+**Software breakpoints** (`breakpoint.c`) — read the target byte via
+`PTRACE_PEEKTEXT`, save it, write back the word with the low byte replaced
+by `0xCC` via `PTRACE_POKETEXT`. On `SIGTRAP`, `rip - 1` is checked against
+the breakpoint table (the CPU already advanced past the 1-byte `INT3`).
+Resuming from a breakpoint means: restore the original byte, rewind `rip`,
+single-step over the real instruction, reinsert `0xCC`, then continue — this
+is `bp_step_over`. Handles the "cont from a stopped breakpoint" case
+automatically.
+
+**Hardware watchpoints** (`dbgregs.c`) — `PTRACE_PEEKUSER`/`PTRACE_POKEUSER`
+at `offsetof(struct user, u_debugreg[n])`. DR0–DR3 hold up to 4 linear
+addresses; DR7 controls per-slot local-enable bits, R/W type (00 exec, 01
+write, 11 read/write), and length (00/01/11/10 → 1/2/4/8 bytes). DR6 is read
+after a trap to identify which slot fired. This is a hardware feature — no
+memory is patched, no single-stepping overhead, and it can watch data reads
+(mode `rw`) which software breakpoints can't do at all.
+
+**Single-stepping** — plain `PTRACE_SINGLESTEP`, one instruction per call,
+relies on the CPU's trap flag rather than any software instrumentation.
+
+## Verified
+
+Tested against `test/target.c` (both `-no-pie` and `-pie` builds) on x86-64
+Linux 6.18:
+
+- symbol resolution and `.symtab` listing on both binary types
+- software breakpoint hit/resume across 5 loop iterations, correct register
+  state at each hit (`rdi` showing the loop counter), clean process exit
+  after the last breakpoint is stepped over
+- pending breakpoints set before `run` correctly relocated by the PIE load
+  base read from `/proc/pid/maps`
+- hardware DR0 write-watchpoint on a global variable, firing exactly on
+  each write with correct `rax` at the trap
+- attach/detach path exercised against the launched child
+
+## Not implemented / known limitations
+
+- **DWARF**: no line-number or variable-type info. Breakpoints are
+  function-entry / raw-address only; no `break file.c:42`, no source
+  listing, no expression evaluation of local variables.
+- **Multi-threaded targets**: only the main thread/pid is traced.
+  `PTRACE_ATTACH` on individual tasks in a multi-threaded process, and
+  correctly demuxing which thread hit which breakpoint, isn't handled.
+- **Watchpoint length=8 encoding** (`10` in the DR7 LEN field) requires
+  CPUs that support the AMD/Intel extension for 8-byte ranges; not checked
+  against `cpuid`, just emitted and trusted to work or fail at the kernel
+  level.
+- **No disassembler**: `mem` dumps raw hex, doesn't decode instructions to
+  show what's at a breakpoint.
+- **No stack unwinder**: no `backtrace` command; `rbp`-chain walking isn't
+  implemented (and wouldn't be reliable against `-fomit-frame-pointer`
+  code anyway).
+- **Race on breakpoint install for `run`**: breakpoints are installed right
+  after the post-`execve` stop, before the target has run any of its own
+  instructions, so this is safe for statically-known addresses — but there's
+  no support for breakpoints on dynamically loaded shared-library code
+  (would need to trap the dynamic linker's mapping events).
+- **Signal handling passthrough**: `cont`/`step` always resume with signal
+  0; a real target that relies on catching e.g. `SIGSEGV` itself won't see
+  the original signal forwarded.
+- Only tested on binaries built with `gcc -O0 -g`; not tested against
+  stripped binaries (symbol resolution would simply find nothing, which is
+  the correct/expected behavior, but wasn't explicitly exercised) or
+  against `-O2`+ optimized code.
+
+# credits 
+
+all credit goes to me kds1123001 aka yo boi ezdomernuggetkid
